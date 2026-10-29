@@ -1,8 +1,8 @@
 pub mod fastcdc;
 
 pub use fastcdc::{
-    collect_raw_features, cut_gear, Chunk, ChunkData, FastCDC, Normalization,
-    StreamCDC, GEAR, MASKS,
+    collect_raw_features, cut_gear, Chunk, ChunkData, FastCDC, Normalization, StreamCDC, GEAR,
+    MASKS,
 };
 
 const KB: usize = 1024;
@@ -16,21 +16,13 @@ pub struct CdcConfig {
 
 impl Default for CdcConfig {
     fn default() -> Self {
-        Self {
-            min_size: 512 * KB,
-            avg_size: KB * KB,
-            max_size: 2 * KB * KB,
-        }
+        Self { min_size: 512 * KB, avg_size: KB * KB, max_size: 2 * KB * KB }
     }
 }
 
 impl CdcConfig {
-    pub fn new(min_size: usize, avg_size: usize, max_size:usize) -> Self{
-        Self {
-            min_size,
-            avg_size,
-            max_size,
-        }
+    pub fn new(min_size: usize, avg_size: usize, max_size: usize) -> Self {
+        Self { min_size, avg_size, max_size }
     }
 
     pub fn chunk_slice<'a>(&self, data: &'a [u8]) -> FastCDC<'a> {
@@ -41,7 +33,6 @@ impl CdcConfig {
         StreamCDC::new(reader, self.min_size, self.avg_size, self.max_size)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
