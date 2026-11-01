@@ -7,6 +7,12 @@ pub trait ChunkHash: Clone + Eq + std::hash::Hash + Send + Sync + 'static {}
 impl<T: Clone + Eq + std::hash::Hash + Send + Sync + 'static> ChunkHash for T {}
 
 pub trait Database<K, V> {
+    /// Inserts a key-value pair into the database.
+    ///
+    /// # Idempotency and Overwrite Behavior
+    /// In content-addressable storage (CAS), inserting with an identical key is idempotent
+    /// when the underlying payload is identical. If the key already exists, the entry
+    /// is overwritten without error.
     fn insert(&mut self, key: K, value: V) -> io::Result<()>;
     fn get(&self, key: &K) -> io::Result<V>;
     fn contains(&self, key: &K) -> bool;

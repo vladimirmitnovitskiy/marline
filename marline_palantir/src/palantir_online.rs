@@ -7,33 +7,21 @@ use crate::mock_rocksdb::{Entry, MockRocksDBMap};
 use crate::palantir_scrubber::get_entry;
 use crate::sf_generator::SuperFeatureGenerator;
 use crate::types::{BlockID, TierConfig};
-use chunkfs::{ChunkHash, Database};
 use marline_index::heuristic_index::SearchConfig;
+use marline_storage::{ChunkHash, Database};
 use std::collections::HashMap;
-use std::hash::Hash;
 
 /// Minimum chunk size used by the online chunker; also the start of the
 /// feature-collection window inside each chunk.
 pub const CHUNK_MIN_SIZE: usize = 1024 * 512;
 
-pub trait OnlineSBC<
-    S,
-    H: Clone + Eq + Hash + Send + Sync + 'static + std::default::Default,
-    E,
-    const N: usize,
->
-{
+pub trait OnlineSBC<S, H: ChunkHash, E, const N: usize> {
     fn write(&mut self, data: &[u8]) -> Result<(), PalantirError>;
 
     fn bytes_stored(&self) -> usize;
 }
 
-pub struct PalantirOnline<
-    S,
-    H: Clone + Eq + Hash + Send + Sync + 'static + std::default::Default,
-    E: PalantirEncoder,
-    const N: usize,
-> {
+pub struct PalantirOnline<S, H: ChunkHash, E: PalantirEncoder, const N: usize> {
     sf_gen: S,
     /// Multi-tier similarity index.
     metadata_manager: MetadataManager<H, N>,
@@ -91,7 +79,8 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize> OnlineSBC<S, 
                                 &mut self.manifest_base,
                                 &self.delta_bases,
                                 &base_hash.hash,
-                            );
+                            )
+                            .map_err(|e| PalantirError::ChunkError(e.to_string()))?;
 
                             let data = entry.get_data().to_vec();
 
@@ -170,13 +159,7 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize> OnlineSBC<S, 
     }
 }
 
-impl<
-        S,
-        H: ChunkHash + Clone + Eq + Hash + Send + Sync + 'static,
-        E: PalantirEncoder,
-        const N: usize,
-    > PalantirOnline<S, H, E, N>
-{
+impl<S, H: ChunkHash, E: PalantirEncoder, const N: usize> PalantirOnline<S, H, E, N> {
     /// Creates a new `PalantirScrubber`.
     ///
     /// # Arguments

@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use chunkfs::hashers::Sha256Hasher;
-use chunkfs::{Data, DataContainer, Hasher, Scrub};
 use marline_index::heuristic_index::SearchConfig;
 use marline_palantir::encoder::GdeltaEncoder;
 use marline_palantir::lifecycle_manager::LifecycleManager;
@@ -9,9 +7,13 @@ use marline_palantir::metadata_manager::MetadataManager;
 use marline_palantir::palantir_scrubber::PalantirScrubber;
 use marline_palantir::sf_generator::{PalantirHasher, SuperFeatureGenerator};
 use marline_palantir::types::{BlockID, Chunk, TierConfig};
+use marline_storage::{Data, DataContainer, Database, InMemoryDatabase};
+use sha2::{Digest, Sha256};
 
 fn hash_data(data: &[u8]) -> [u8; 32] {
-    Sha256Hasher::default().hash(data)
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 #[test]
@@ -62,9 +64,9 @@ fn similar_chunks() {
     let hash_base = hash_data(&base);
     let hash_similar = hash_data(&similar);
 
-    let mut database = HashMap::new();
-    database.insert(hash_base, DataContainer::from(base.clone()));
-    database.insert(hash_similar, DataContainer::from(similar.clone()));
+    let mut database = InMemoryDatabase::new();
+    database.insert(hash_base, DataContainer::from(base.clone())).unwrap();
+    database.insert(hash_similar, DataContainer::from(similar.clone())).unwrap();
 
     let mut target_map = HashMap::new();
     let result = scrubber.scrub(&mut database, &mut target_map).unwrap();
@@ -94,9 +96,57 @@ fn similar_chunks() {
     }
 
     for hash in [&hash_base, &hash_similar] {
-        match database.get(hash).unwrap().extract() {
+        let container = database.get_ref(hash).expect("chunk should exist in db");
+        match container.data() {
             Data::TargetChunk(keys) => assert_eq!(keys.as_slice(), &[*hash]),
             _ => panic!("Expected TargetChunk after scrub"),
         }
     }
+}
+
+#[test]
+fn test_delta_chain_cycle_detection() {
+    let mut delta_bases = HashMap::new();
+    let hash_a = [1u8; 32];
+    let hash_b = [2u8; 32];
+    // Create cycle A -> B -> A
+    delta_bases.insert(hash_a, hash_b);
+    delta_bases.insert(hash_b, hash_a);
+
+    let target_map = HashMap::new();
+    let res = marline_palantir::palantir_scrubber::decoder(&target_map, &delta_bases, &hash_a);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn test_delta_chain_missing_base_not_found() {
+    let mut delta_bases = HashMap::new();
+    let hash_a = [1u8; 32];
+    let hash_b = [2u8; 32];
+    delta_bases.insert(hash_a, hash_b);
+
+    let manifest_base = marline_storage::InMemoryDatabase::new();
+    let res =
+        marline_palantir::palantir_scrubber::get_manifest(&manifest_base, &delta_bases, &hash_a);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn test_delta_chain_depth_limit() {
+    let mut delta_bases = HashMap::new();
+    let mut cur = [0u8; 32];
+    for i in 1..=1025 {
+        let mut next = [0u8; 32];
+        next[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+        delta_bases.insert(cur, next);
+        cur = next;
+    }
+
+    let manifest_base = marline_storage::InMemoryDatabase::new();
+    let res =
+        marline_palantir::palantir_scrubber::get_manifest(&manifest_base, &delta_bases, &[0u8; 32]);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
 }

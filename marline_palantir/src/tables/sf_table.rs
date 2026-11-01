@@ -1,5 +1,4 @@
 use crate::types::{BlockID, SuperFeature};
-use chunkfs::ChunkHash;
 use marline_index::heuristic_index::{HeuristicInvertedSketchIndex, SearchConfig};
 use marline_index::index::metrics::{Metric, MetricStorage, MetricsMap};
 use marline_index::index::store::{IndexStorage, InvertedStorage, Store};
@@ -7,6 +6,7 @@ use marline_index::index::IndexError;
 use marline_index::index::SketchIndexApi;
 use marline_index::sketch::Sketch;
 use marline_index::sketch::U32Sketch;
+use marline_storage::ChunkHash;
 use std::hash::Hash;
 use std::sync::Arc;
 

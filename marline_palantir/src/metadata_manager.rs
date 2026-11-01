@@ -2,10 +2,10 @@ use crate::lifecycle_manager::{LifecycleManager, LifecycleTierConfig};
 use crate::tables::{FPTable, SFTable};
 use crate::types::{BlockID, SuperFeature, TierConfig};
 use crate::utils::lcm_vec;
-use chunkfs::ChunkHash;
 use marline_index::heuristic_index::SearchConfig;
 use marline_index::index::metrics::Metric;
 use marline_index::index::IndexError;
+use marline_storage::ChunkHash;
 
 pub type TierID = u8;
 

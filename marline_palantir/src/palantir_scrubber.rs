@@ -1,8 +1,8 @@
-use chunkfs::{
-    ChunkHash, Data, DataContainer, Database, IterableDatabase, Scrub, ScrubMeasurements,
-};
 use marline_scrub::decoder::{Decoder, GdeltaDecoder};
-use std::collections::HashMap;
+use marline_storage::{
+    ChunkHash, Data, DataContainer, Database, InMemoryDatabase, IterableDatabase,
+};
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io;
 
@@ -14,6 +14,20 @@ use crate::sf_generator::SuperFeatureGenerator;
 use crate::types::{BlockID, Chunk, TierConfig};
 use marline_index::heuristic_index::SearchConfig;
 use marline_index::index::IndexError;
+
+/// Measurements collected during a scrubbing pass.
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub struct ScrubMeasurements {
+    pub processed_data: usize,
+    pub running_time: std::time::Duration,
+    pub data_left: usize,
+}
+
+impl ScrubMeasurements {
+    pub fn new(processed_data: usize, running_time: std::time::Duration, data_left: usize) -> Self {
+        Self { processed_data, running_time, data_left }
+    }
+}
 
 /// Core scrubbing pipeline that applies the Palantir method to a storage backend.
 ///
@@ -108,27 +122,23 @@ impl<S, H: ChunkHash + Clone + Eq + Hash + Send + Sync + 'static, E, const N: us
     }
 }
 
-impl<B, S, E, const N: usize> Scrub<[u8; 32], B, [u8; 32], HashMap<[u8; 32], Vec<u8>>>
-    for PalantirScrubber<S, [u8; 32], E, N>
-where
-    B: IterableDatabase<[u8; 32], DataContainer<[u8; 32]>>,
-    S: SuperFeatureGenerator,
-    E: PalantirEncoder,
+impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize>
+    PalantirScrubber<S, [u8; 32], E, N>
 {
-    fn scrub<'a>(
+    pub fn scrub<B>(
         &mut self,
         database: &mut B,
         target_map: &mut HashMap<[u8; 32], Vec<u8>>,
     ) -> io::Result<ScrubMeasurements>
     where
-        [u8; 32]: 'a,
+        B: IterableDatabase<[u8; 32], DataContainer<[u8; 32]>>,
     {
         let start = std::time::Instant::now();
         let mut processed_data = 0;
         let data_left = 0;
 
-        for (hash, container) in database.iterator_mut() {
-            match container.extract() {
+        for (hash, container) in database.iter_mut() {
+            match container.data() {
                 Data::Chunk(chunk_data) => {
                     let chunk = Chunk::new(chunk_data.clone());
                     let super_features = self.sf_gen.generate(&chunk);
@@ -141,15 +151,14 @@ where
                                         &self.manifest_base,
                                         &self.delta_bases,
                                         &base_hash.hash,
-                                    ) {
+                                    )? {
                                         (base_chunk, None) => {
                                             let delta = self.encoder.encode(chunk_data, base_chunk);
                                             let delta_compressed = delta.clone();
                                             let simple_compressed = delta.clone();
                                             let _ratio = delta_compressed.len() as f64
                                                 / simple_compressed.len() as f64;
-
-                                            let _ = &mut target_map.insert(*hash, delta_compressed);
+                                            target_map.insert(*hash, delta_compressed);
                                             self.delta_bases.insert(*hash, base_hash.hash);
                                             self.delta_stored += 1;
                                         }
@@ -164,13 +173,12 @@ where
                                             let ratio = delta_compressed.len() as f64
                                                 / simple_compressed.len() as f64;
                                             if ratio < self.fp_threshold {
-                                                let _ =
-                                                    &mut target_map.insert(*hash, delta_compressed);
+                                                target_map.insert(*hash, delta_compressed);
                                                 self.delta_bases.insert(*hash, base_hash.hash);
                                                 self.delta_stored += 1;
                                             } else {
                                                 target_map.insert(*hash, chunk_data.clone());
-                                                let _ = &mut self.manifest_base.insert(
+                                                self.manifest_base.insert(
                                                     *hash,
                                                     Entry::from(chunk_data.clone()),
                                                 )?;
@@ -180,11 +188,9 @@ where
                                     processed_data += chunk_data.len();
                                 }
                                 None => {
-                                    // let fp_table = E::generate_fp_table(&chunk.as_bytes());
                                     let fp_table = None;
                                     target_map.insert(*hash, chunk_data.clone());
-                                    let _ = &self
-                                        .manifest_base
+                                    self.manifest_base
                                         .insert(*hash, Entry::new(fp_table, chunk_data.clone()))?;
                                     processed_data += chunk_data.len();
                                 }
@@ -204,63 +210,97 @@ where
             }
         }
 
-        Ok(ScrubMeasurements {
-            processed_data,
-            running_time: start.elapsed(),
-            data_left,
-            clusterization_report: None,
-        })
+        Ok(ScrubMeasurements { processed_data, running_time: start.elapsed(), data_left })
     }
 }
 
-#[allow(dead_code)]
-fn decoder(
-    target_map: &MockRocksDBMap,
+const MAX_CHAIN_DEPTH: usize = 1024;
+
+/// Walks `delta_bases` from `start` to the root hash.
+/// Returns `Err` with `ErrorKind::InvalidData` if a cycle is detected or depth exceeds `MAX_CHAIN_DEPTH`.
+fn walk_to_root(
+    delta_bases: &HashMap<[u8; 32], [u8; 32]>,
+    start: &[u8; 32],
+) -> io::Result<([u8; 32], Vec<[u8; 32]>)> {
+    let mut chain = Vec::new();
+    let mut cur = *start;
+    let mut seen = HashSet::new();
+    seen.insert(cur);
+    while let Some(&base) = delta_bases.get(&cur) {
+        if chain.len() >= MAX_CHAIN_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "delta chain exceeds maximum depth",
+            ));
+        }
+        chain.push(cur);
+        cur = base;
+        if !seen.insert(cur) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cycle detected in delta chain",
+            ));
+        }
+    }
+    Ok((cur, chain))
+}
+
+pub type ManifestData<'a> = (&'a Vec<u8>, &'a Option<HashMap<u64, u32>>);
+
+/// Retrieves base chunk data and optional manifest by resolving the delta chain to its root.
+///
+/// # Errors
+/// * Returns `ErrorKind::InvalidData` if a cycle is detected or depth exceeds `MAX_CHAIN_DEPTH`.
+/// * Returns `ErrorKind::NotFound` if the root chunk is missing from `manifest_base`.
+pub fn get_manifest<'a>(
+    manifest_base: &'a InMemoryDatabase<[u8; 32], Entry>,
+    delta_bases: &HashMap<[u8; 32], [u8; 32]>,
+    hash: &[u8; 32],
+) -> io::Result<ManifestData<'a>> {
+    let (cur, _chain) = walk_to_root(delta_bases, hash)?;
+    let entry = manifest_base.get_ref(&cur).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "base chunk not found in manifest_base")
+    })?;
+    Ok((entry.get_data(), entry.get_manifest()))
+}
+
+/// Retrieves a mutable reference to the root entry by resolving the delta chain.
+///
+/// # Errors
+/// * Returns `ErrorKind::InvalidData` if a cycle is detected or depth exceeds `MAX_CHAIN_DEPTH`.
+/// * Returns `ErrorKind::NotFound` if the root entry is missing from `manifest_base`.
+pub(crate) fn get_entry<'a>(
+    manifest_base: &'a mut InMemoryDatabase<[u8; 32], Entry>,
+    delta_bases: &HashMap<[u8; 32], [u8; 32]>,
+    hash: &[u8; 32],
+) -> io::Result<&'a mut Entry> {
+    let (cur, _chain) = walk_to_root(delta_bases, hash)?;
+    manifest_base.get_mut(&cur).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "base chunk not found in manifest_base")
+    })
+}
+
+/// Decodes a chunk by walking its delta chain back to the root and reconstructing data.
+///
+/// # Preconditions
+/// `target_map` must contain raw data for every hash in the chain, including
+/// the root (base) chunk. This condition is guaranteed after a full `scrub()`
+/// pass has completed.
+pub fn decoder(
+    target_map: &HashMap<[u8; 32], Vec<u8>>,
     delta_bases: &HashMap<[u8; 32], [u8; 32]>,
     hash: &[u8; 32],
 ) -> io::Result<Vec<u8>> {
-    let mut chain = Vec::new();
-    let mut cur = *hash;
-    while let Some(&base) = delta_bases.get(&cur) {
-        chain.push(cur);
-        cur = base;
-    }
-    let mut data = target_map.get(&cur)?.get_data().clone();
-    for &dh in chain.iter().rev() {
-        let compressed = target_map.get_2(&dh).unwrap().get_data();
-        data = GdeltaDecoder::new(true).decode_chunk(data, compressed);
+    let (cur, chain) = walk_to_root(delta_bases, hash)?;
+    let root_data = target_map
+        .get(&cur)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "base chunk not found"))?;
+    let mut data = root_data.clone();
+    for dh in chain.iter().rev() {
+        let delta = target_map
+            .get(dh)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "delta chunk not found"))?;
+        data = GdeltaDecoder::new(true).decode_chunk(data, delta);
     }
     Ok(data)
-}
-
-pub(crate) fn get_manifest<'a>(
-    target_map: &'a MockRocksDBMap,
-    delta_bases: &HashMap<[u8; 32], [u8; 32]>,
-    hash: &[u8; 32],
-) -> (&'a Vec<u8>, &'a Option<HashMap<u64, u32>>) {
-    let mut chain = Vec::new();
-    let mut cur = *hash;
-    while let Some(&base) = delta_bases.get(&cur) {
-        chain.push(cur);
-        cur = base;
-    }
-
-    let base_chunk = target_map.get_2(&cur).unwrap().get_data();
-    let manifest = target_map.get_2(&cur).unwrap().get_manifest();
-    (base_chunk, manifest)
-}
-
-pub(crate) fn get_entry<'a>(
-    target_map: &'a mut MockRocksDBMap,
-    delta_bases: &HashMap<[u8; 32], [u8; 32]>,
-    hash: &[u8; 32],
-) -> &'a mut Entry {
-    let mut chain = Vec::new();
-    let mut cur = *hash;
-    while let Some(&base) = delta_bases.get(&cur) {
-        chain.push(cur);
-        cur = base;
-    }
-
-    target_map.get_2_mut(&cur).unwrap()
 }
