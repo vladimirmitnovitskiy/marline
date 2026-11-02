@@ -1,15 +1,18 @@
 use crate::encoder::PalantirEncoder;
 use crate::error::PalantirError;
-use crate::fastcdc::{collect_raw_features, FastCDC};
 use crate::lifecycle_manager::LifecycleTierConfig;
 use crate::metadata_manager::MetadataManager;
-use crate::mock_rocksdb::{Entry, MockRocksDBMap};
-use crate::palantir_scrubber::get_entry;
+use crate::palantir_scrubber::find_root;
 use crate::sf_generator::SuperFeatureGenerator;
 use crate::types::{BlockID, TierConfig};
+use marline_cdc::{collect_raw_features, FastCDC, StreamCDC};
 use marline_index::heuristic_index::SearchConfig;
-use marline_storage::{ChunkHash, Database};
+use marline_storage::{ChunkHash, MetricsDatabase};
 use std::collections::HashMap;
+
+fn zstd_error(code: zstd::zstd_safe::ErrorCode) -> PalantirError {
+    PalantirError::ChunkError(zstd::zstd_safe::get_error_name(code).to_owned())
+}
 
 /// Minimum chunk size used by the online chunker; also the start of the
 /// feature-collection window inside each chunk.
@@ -17,7 +20,7 @@ pub const CHUNK_MIN_SIZE: usize = 1024 * 512;
 
 pub trait OnlineSBC<S, H: ChunkHash, E, const N: usize> {
     fn write(&mut self, data: &[u8]) -> Result<(), PalantirError>;
-
+    fn write_stream<R: std::io::Read>(&mut self, reader: R) -> Result<(), PalantirError>;
     fn bytes_stored(&self) -> usize;
 }
 
@@ -32,150 +35,203 @@ pub struct PalantirOnline<S, H: ChunkHash, E: PalantirEncoder, const N: usize> {
     /// Compute super-features with a second scan over each chunk (baseline
     /// two-pass mode) instead of reusing raw features collected during chunking.
     naive: bool,
-    /// Total chunks processed.
+    /// Total chunks processed through the pipeline (including duplicates and small chunks).
     chunks_processed: u64,
-    /// Count of chunks stored as deltas.
-    delta_stored: u64,
-    /// Tracks chunk hash → base hash for stored deltas (chain rebuild).
-    delta_bases: HashMap<H, H>,
-    manifest_base: MockRocksDBMap,
-    target_map: HashMap<H, Vec<u8>>,
+    /// Sum of lengths of all processed chunks, including duplicates and small chunks;
+    /// the denominator of the data reduction ratio.
+    logical_bytes: u64,
+    /// Set after a delta-index invariant violation; all further writes are rejected.
+    poisoned: bool,
+    /// Database for chunk storage and metrics.
+    db: MetricsDatabase<H>,
+    /// Reusable hasher to avoid re-allocating state per chunk.
+    hasher: blake3::Hasher,
+    /// Reusable zstd compression context (avoids creating a context per chunk).
+    cctx: zstd::zstd_safe::CCtx<'static>,
+    /// Reusable compression buffer for evaluating simple compression size.
+    /// `clear` + `reserve` up to the worst-case compressed bound before each use;
+    /// capacity stabilizes after the first large chunk.
+    compress_buf: Vec<u8>,
+    /// Reusable compression buffer for evaluating delta compression size.
+    /// `clear` + `reserve` up to the worst-case compressed bound before each use;
+    /// capacity stabilizes after the first large chunk.
+    delta_compress_buf: Vec<u8>,
+    /// Whether manifests (precalculated word-offset tables) are generated for new base chunks.
+    manifests_enabled: bool,
+    /// Store of manifests for base chunks: chunk hash -> word offset map.
+    ///
+    /// Each table occupies roughly 10–16× the size of its base chunk. There is no
+    /// eviction policy: memory is reclaimed only via [`Self::remove_manifest`] /
+    /// [`Self::clear_manifests`].
+    manifests: HashMap<H, HashMap<u64, u32>>,
 }
 
-#[allow(unused_variables)]
-impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize> OnlineSBC<S, [u8; 32], E, N>
-    for PalantirOnline<S, [u8; 32], E, N>
+impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize>
+    PalantirOnline<S, [u8; 32], E, N>
 {
-    fn write(&mut self, data: &[u8]) -> Result<(), PalantirError> {
-        let chunker = FastCDC::new(data, CHUNK_MIN_SIZE, 1024 * 1024, 2 * 1024 * 1024);
-        // let chunker = FastCDC::new(&data, 1024 * 8, 16 * 1024, 32 * 1024);
+    fn process_chunk(&mut self, chunk_data: &[u8], sf_raw: [u32; 12]) -> Result<(), PalantirError> {
+        self.chunks_processed += 1;
+        self.logical_bytes += chunk_data.len() as u64;
 
-        for (chunk, sf_raw) in chunker {
-            let chunk_data = &data[chunk.offset..chunk.offset + chunk.length].to_vec();
-            let mut hasher = blake3::Hasher::new();
-            //println!("size: {}, SF{:?}", chunk_data.len(), sf_raw);
-            hasher.update(chunk_data);
-            let hash = hasher.finalize();
-            let hash = hash.as_bytes();
-            // let super_features = self.sf_gen.generate(&Chunk::new(chunk_data.clone()));
+        self.hasher.reset();
+        self.hasher.update(chunk_data);
+        let hash: [u8; 32] = *self.hasher.finalize().as_bytes();
 
-            match self.metadata_manager.lookup_fingerprint(hash) {
-                Some(_) => {}
-                None => {
-                    let super_features = if self.naive {
-                        // Baseline: recompute features with a second scan
-                        // over the chunk data instead of reusing the
-                        // in-pass features.
-                        let sf = collect_raw_features(chunk_data, CHUNK_MIN_SIZE);
-                        debug_assert_eq!(sf, sf_raw, "two-pass features must equal in-pass");
-                        self.sf_gen.generate_from_raw(&sf)
-                    } else {
-                        self.sf_gen.generate_from_raw(&sf_raw)
-                    };
+        // Защита от дубликатов (как base, так и deltas)
+        if self.db.contains(&hash) {
+            return Ok(());
+        }
 
-                    match self.metadata_manager.lookup_super_features(&super_features) {
-                        Some((base_hash, _)) => {
-                            let entry = get_entry(
-                                &mut self.manifest_base,
-                                &self.delta_bases,
-                                &base_hash.hash,
-                            )
-                            .map_err(|e| PalantirError::ChunkError(e.to_string()))?;
+        // Защита от ложных совпадений: если чанк <= CHUNK_MIN_SIZE, feature-окно пусто, сохраняем как base
+        if chunk_data.len() <= CHUNK_MIN_SIZE {
+            self.db.insert(hash, chunk_data);
+            return Ok(());
+        }
 
-                            let data = entry.get_data().to_vec();
+        let super_features = if self.naive {
+            let sf = collect_raw_features(chunk_data, CHUNK_MIN_SIZE);
+            debug_assert_eq!(sf, sf_raw, "two-pass features must equal in-pass");
+            self.sf_gen.generate_from_raw(&sf)
+        } else {
+            self.sf_gen.generate_from_raw(&sf_raw)
+        };
 
-                            match entry.get_manifest() {
-                                Some(manifest) => {
-                                    let delta = self.encoder.encode_with_manifest(
-                                        chunk_data,
-                                        entry.get_data(),
-                                        manifest,
-                                    );
-                                    let delta_compressed =
-                                        zstd::encode_all(delta.as_slice(), 0).unwrap();
-                                    let simple_compressed =
-                                        zstd::encode_all(chunk_data.as_slice(), 0).unwrap();
-                                    let ratio = delta_compressed.len() as f64
-                                        / simple_compressed.len() as f64;
-                                    if ratio < self.fp_threshold {
-                                        let _ = self.target_map.insert(*hash, delta_compressed);
-                                        self.delta_bases.insert(*hash, base_hash.hash);
-                                        self.delta_stored += 1;
-                                    } else {
-                                        self.target_map.insert(*hash, chunk_data.clone());
-                                        let _ = &mut self
-                                            .manifest_base
-                                            .insert(*hash, Entry::from(chunk_data.clone()));
-                                    }
-                                }
-                                None => {
-                                    /*
-                                    let fp_table = E::generate_fp_table(&data);
-                                    let _ = self.manifest_base.insert(*hash, Entry::new(fp_table.clone(), chunk_data.clone()));
-
-                                    let delta = self
-                                        .encoder
-                                        .encode_with_manifest(chunk_data, &data, &fp_table.unwrap());
-                                        */
-
-                                    //let delta = self.encoder.encode(chunk_data, &data);
-
-                                    //let delta_compressed =
-                                    //   zstd::encode_all(delta.as_slice(), 0).unwrap();
-
-                                    // let delta_compressed = zstd::encode_all(chunk_data.as_slice(), 0).unwrap();
-                                    let delta_compressed = data;
-
-                                    let _ = self.target_map.insert(*hash, delta_compressed);
-                                    self.delta_bases.insert(*hash, base_hash.hash);
-                                    self.delta_stored += 1;
-                                }
-                            }
-                        }
-                        None => {
-                            // let fp_table = E::generate_fp_table(&chunk.as_bytes());
-                            let fp_table = None;
-                            // let chunk_data = zstd::encode_all(chunk_data.as_slice(), 0).unwrap();
-                            self.target_map.insert(*hash, chunk_data.clone());
-                            let _ = &self
-                                .manifest_base
-                                .insert(*hash, Entry::new(fp_table, chunk_data.clone()));
-                        }
+        match self.metadata_manager.lookup_super_features(&super_features) {
+            Some((base_hash, _)) => {
+                // Находим корень цепочки: алгоритм Флойда, O(1) по памяти (по времени O(глубина))
+                let root_hash = match find_root(self.db.delta_bases(), &base_hash.hash) {
+                    Ok(root) => root,
+                    Err(e) => {
+                        self.poisoned = true;
+                        return Err(PalantirError::MetadataError(e.to_string()));
                     }
+                };
 
-                    self.metadata_manager.add_block(*hash, &super_features, BlockID::new(*hash));
+                // Политика B: рассинхрон индекса фатален в debug и release, без fallback.
+                let Some(base_data) = self.db.get_ref(&root_hash) else {
+                    self.poisoned = true;
+                    return Err(PalantirError::MetadataError(format!(
+                        "index desync: root {} is not a stored base chunk",
+                        blake3::Hash::from_bytes(root_hash).to_hex()
+                    )));
+                };
+
+                let delta = if let Some(manifest) = self.manifests.get(&root_hash) {
+                    self.encoder.encode_with_manifest(chunk_data, base_data, manifest)
+                } else {
+                    self.encoder.encode(chunk_data, base_data)
+                };
+
+                // Сжимаем дельту в переиспользуемый буфер
+                self.delta_compress_buf.clear();
+                self.delta_compress_buf.reserve(zstd::zstd_safe::compress_bound(delta.len()));
+                let delta_comp_size = self
+                    .cctx
+                    .compress(&mut self.delta_compress_buf, &delta, 0)
+                    .map_err(zstd_error)?;
+
+                // Вычисляем размер простого сжатия чанка в переиспользуемый буфер
+                self.compress_buf.clear();
+                self.compress_buf.reserve(zstd::zstd_safe::compress_bound(chunk_data.len()));
+                let simple_size = self
+                    .cctx
+                    .compress(&mut self.compress_buf, chunk_data, 0)
+                    .map_err(zstd_error)?;
+
+                if simple_size > 0
+                    && (delta_comp_size as f64) < (simple_size as f64) * self.fp_threshold
+                {
+                    // Кодируем против корня намеренно: цепочки остаются плоскими,
+                    // restore — один шаг декодирования (O(1)). Известный компромисс:
+                    // на эволюционирующих данных дельты к корню растут со временем.
+                    // Не заменять на `base_hash.hash`.
+                    if !self.db.insert_delta(hash, root_hash, &self.delta_compress_buf) {
+                        self.poisoned = true;
+                        return Err(PalantirError::MetadataError(
+                            "index desync: insert_delta rejected a verified root".into(),
+                        ));
+                    }
+                } else {
+                    self.save_base_chunk(hash, chunk_data);
                 }
             }
-            self.chunks_processed += 1;
+            None => {
+                self.save_base_chunk(hash, chunk_data);
+            }
+        }
+
+        self.metadata_manager.add_block(hash, &super_features, BlockID::new(hash));
+        Ok(())
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<(), PalantirError> {
+        if self.poisoned {
+            return Err(PalantirError::MetadataError(
+                "instance poisoned by earlier index corruption".into(),
+            ));
         }
         Ok(())
     }
-    fn bytes_stored(&self) -> usize {
-        let mut size = 0usize;
-        for val in self.target_map.values() {
-            size += val.len()
+
+    fn save_base_chunk(&mut self, hash: [u8; 32], chunk_data: &[u8]) {
+        self.db.insert(hash, chunk_data);
+        if self.manifests_enabled {
+            if let Some(manifest) = E::generate_fp_table(chunk_data) {
+                self.manifests.insert(hash, manifest);
+            }
         }
-        size
+    }
+}
+
+impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize> OnlineSBC<S, [u8; 32], E, N>
+    for PalantirOnline<S, [u8; 32], E, N>
+{
+    /// Chunks `data` in memory and processes every chunk through the pipeline.
+    ///
+    /// # Errors
+    /// * [`PalantirError::MetadataError`] — delta-index corruption (cycle, excessive chain
+    ///   depth, a root missing from storage, or a rejected delta insert). The instance is
+    ///   poisoned: this and all further writes are rejected (see [`Self::is_poisoned`]).
+    /// * Any other error (chunking, I/O, compression) aborts only this call; the instance
+    ///   stays usable and chunks processed before the error remain stored.
+    fn write(&mut self, data: &[u8]) -> Result<(), PalantirError> {
+        self.ensure_not_poisoned()?;
+        let chunker = FastCDC::new(data, CHUNK_MIN_SIZE, 1024 * 1024, 2 * 1024 * 1024);
+        for (chunk, sf_raw) in chunker {
+            let chunk_data = chunk
+                .offset
+                .checked_add(chunk.length)
+                .and_then(|end| data.get(chunk.offset..end))
+                .ok_or_else(|| PalantirError::ChunkError("chunk out of bounds".into()))?;
+            self.process_chunk(chunk_data, sf_raw)?;
+        }
+        Ok(())
+    }
+
+    /// Chunks the `reader` stream and processes every chunk through the pipeline.
+    ///
+    /// # Errors
+    /// * [`PalantirError::MetadataError`] — delta-index corruption (cycle, excessive chain
+    ///   depth, a root missing from storage, or a rejected delta insert). The instance is
+    ///   poisoned: this and all further writes are rejected (see [`Self::is_poisoned`]).
+    /// * Any other error (chunking, I/O, compression) aborts only this call; the instance
+    ///   stays usable and chunks processed before the error remain stored.
+    fn write_stream<R: std::io::Read>(&mut self, reader: R) -> Result<(), PalantirError> {
+        self.ensure_not_poisoned()?;
+        let chunker = StreamCDC::new(reader, CHUNK_MIN_SIZE, 1024 * 1024, 2 * 1024 * 1024);
+        for result in chunker {
+            let (chunk, sf_raw) = result.map_err(|e| PalantirError::ChunkError(e.to_string()))?;
+            self.process_chunk(&chunk.data, sf_raw)?;
+        }
+        Ok(())
+    }
+
+    fn bytes_stored(&self) -> usize {
+        self.db.total_saved_bytes()
     }
 }
 
 impl<S, H: ChunkHash, E: PalantirEncoder, const N: usize> PalantirOnline<S, H, E, N> {
-    /// Creates a new `PalantirScrubber`.
-    ///
-    /// # Arguments
-    /// * `sf_gen` — The super-feature generator.
-    /// * `encoder` — The delta encoder.
-    /// * `tier_config` — Tier configuration (super-feature sizes per tier).
-    /// * `lifecycle_configs` — Per-tier lifecycle policies.
-    ///
-    /// # Defaults
-    ///
-    /// | Field | Value |
-    /// |-------|-------|
-    /// | `fp_threshold` | `0.9` — false-positive ratio cap |
-    /// | `chunks_processed` | `0` |
-    /// | `delta_stored` | `0` | number of stored chunks by delta
-    /// | `delta_bases` | empty hashmap | remember of chunk is delta of other chunk
     pub fn new(
         sf_gen: S,
         encoder: E,
@@ -190,128 +246,398 @@ impl<S, H: ChunkHash, E: PalantirEncoder, const N: usize> PalantirOnline<S, H, E
             fp_threshold: 0.9,
             naive: false,
             chunks_processed: 0,
-            delta_stored: 0,
-            delta_bases: HashMap::new(),
-            manifest_base: MockRocksDBMap::new(),
-            target_map: HashMap::new(),
+            logical_bytes: 0,
+            poisoned: false,
+            db: MetricsDatabase::new(),
+            hasher: blake3::Hasher::new(),
+            cctx: zstd::zstd_safe::CCtx::create(),
+            compress_buf: Vec::new(),
+            delta_compress_buf: Vec::new(),
+            manifests_enabled: false,
+            manifests: HashMap::new(),
         }
     }
 
-    /// Switches between the optimized single-pass and baseline two-pass
-    /// super-feature computation.
+    /// Builder method to configure automatic manifest generation for base chunks.
     ///
-    /// When `true`, super-features for each chunk are computed with a second
-    /// full scan of the chunk data (`generate`); when `false` (default), raw
-    /// features collected during chunking are reused (`generate_from_raw`).
+    /// Memory: each manifest occupies roughly 10–16× the size of its base chunk.
+    /// Manifests are never evicted automatically; reclaim memory via
+    /// [`Self::remove_manifest`] / [`Self::clear_manifests`].
+    pub fn with_manifests(mut self, enabled: bool) -> Self {
+        self.manifests_enabled = enabled;
+        self
+    }
+
+    /// Dynamically switches automatic manifest generation on or off.
+    pub fn set_manifests_enabled(&mut self, enabled: bool) {
+        self.manifests_enabled = enabled;
+    }
+
+    /// Returns whether automatic manifest generation is enabled.
+    pub fn manifests_enabled(&self) -> bool {
+        self.manifests_enabled
+    }
+
+    /// Generates and stores a manifest for an existing base chunk in storage.
+    /// Returns true if the chunk exists in `db` and the manifest was generated.
+    pub fn generate_manifest_for(&mut self, hash: &H) -> bool {
+        if let Some(base_data) = self.db.get_ref(hash) {
+            if let Some(manifest) = E::generate_fp_table(base_data) {
+                self.manifests.insert(hash.clone(), manifest);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Removes a precomputed manifest for a base chunk to reclaim memory.
+    /// The base chunk remains in storage; future deltas against it will use on-the-fly encoding.
+    pub fn remove_manifest(&mut self, hash: &H) -> Option<HashMap<u64, u32>> {
+        self.manifests.remove(hash)
+    }
+
+    /// Clears all stored manifests to reclaim memory.
+    pub fn clear_manifests(&mut self) {
+        self.manifests.clear();
+    }
+
+    /// Returns whether a manifest is stored for the given chunk hash.
+    pub fn has_manifest(&self, hash: &H) -> bool {
+        self.manifests.contains_key(hash)
+    }
+
+    /// Returns a reference to the manifest for the given chunk hash, if present.
+    pub fn manifest(&self, hash: &H) -> Option<&HashMap<u64, u32>> {
+        self.manifests.get(hash)
+    }
+
+    /// Returns the number of manifests currently cached in memory.
+    pub fn manifests_count(&self) -> usize {
+        self.manifests.len()
+    }
+
     pub fn set_naive(&mut self, naive: bool) {
         self.naive = naive;
     }
+
+    /// Returns total raw uncompressed bytes stored for base chunks.
+    pub fn base_bytes(&self) -> usize {
+        self.db.base_bytes()
+    }
+
+    /// Returns total compressed bytes accounted for delta chunks.
+    pub fn delta_bytes(&self) -> usize {
+        self.db.delta_bytes()
+    }
+
+    pub fn chunks_processed(&self) -> u64 {
+        self.chunks_processed
+    }
+
+    /// Sum of lengths of all processed chunks, including duplicates and small chunks.
+    pub fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    /// Whether the instance was poisoned by delta-index corruption (all writes are rejected).
+    /// Metric getters remain available and reflect the state at the moment of failure
+    /// (`logical_bytes` / `chunks_processed` include the failing chunk).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn unique_chunks_count(&self) -> usize {
+        self.db.unique_chunks_count()
+    }
+
+    pub fn delta_chunks_count(&self) -> usize {
+        self.db.delta_chunks_count()
+    }
 }
 
-// Masks for each of the desired number of bits, where 0 through 5 are unused.
-// The values for sizes 64 bytes through 128 kilo-bytes comes from the C
-// reference implementation (found in the https://github.com/wxiacode/FastCDC-c repository)
-// while the extra values come from the https://github.com/wxiacode/restic-FastCDC repository.
-// The FastCDC paper claims that the deduplication ratio is slightly improved when the mask
-// bits are spread relatively evenly, hence these seemingly "magic" values.
-#[allow(dead_code)]
-const MASKS: [u64; 26] = [
-    0,                  // padding
-    0,                  // padding
-    0,                  // padding
-    0,                  // padding
-    0,                  // padding
-    0x0000000001804110, // unused except for NC 3
-    0x0000000001803110, // 64B
-    0x0000000018035100, // 128B
-    0x0000001800035300, // 256B
-    0x0000019000353000, // 512B
-    0x0000590003530000, // 1KB
-    0x0000d90003530000, // 2KB
-    0x0000d90103530000, // 4KB
-    0x0000d90303530000, // 8KB
-    0x0000d90313530000, // 16KB
-    0x0000d90f03530000, // 32KB
-    0x0000d90303537000, // 64KB
-    0x0000d90703537000, // 128KB
-    0x0000d90707537000, // 256KB
-    0x0000d91707537000, // 512KB
-    0x0000d91747537000, // 1MB
-    0x0000d91767537000, // 2MB
-    0x0000d93767537000, // 4MB
-    0x0000d93777537000, // 8MB
-    0x0000d93777577000, // 16MB
-    0x0000db3777577000, // unused except for NC 3
-];
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoder::GdeltaEncoder;
+    use crate::lifecycle_manager::LifecycleManager;
+    use crate::sf_generator::PalantirHasher;
+    use std::io::Cursor;
 
-// GEAR contains seemingly random numbers which are created by computing the
-// MD5 digest of values from 0 to 255, using only the high 8 bytes of the 16
-// byte digest. This is the "gear hash" referred to the in FastCDC paper.
-#[allow(dead_code)]
-#[rustfmt::skip]
-const GEAR: [u64; 256] = [
-    0x3b5d3c7d207e37dc, 0x784d68ba91123086, 0xcd52880f882e7298, 0xeacf8e4e19fdcca7,
-    0xc31f385dfbd1632b, 0x1d5f27001e25abe6, 0x83130bde3c9ad991, 0xc4b225676e9b7649,
-    0xaa329b29e08eb499, 0xb67fcbd21e577d58, 0x0027baaada2acf6b, 0xe3ef2d5ac73c2226,
-    0x0890f24d6ed312b7, 0xa809e036851d7c7e, 0xf0a6fe5e0013d81b, 0x1d026304452cec14,
-    0x03864632648e248f, 0xcdaacf3dcd92b9b4, 0xf5e012e63c187856, 0x8862f9d3821c00b6,
-    0xa82f7338750f6f8a, 0x1e583dc6c1cb0b6f, 0x7a3145b69743a7f1, 0xabb20fee404807eb,
-    0xb14b3cfe07b83a5d, 0xb9dc27898adb9a0f, 0x3703f5e91baa62be, 0xcf0bb866815f7d98,
-    0x3d9867c41ea9dcd3, 0x1be1fa65442bf22c, 0x14300da4c55631d9, 0xe698e9cbc6545c99,
-    0x4763107ec64e92a5, 0xc65821fc65696a24, 0x76196c064822f0b7, 0x485be841f3525e01,
-    0xf652bc9c85974ff5, 0xcad8352face9e3e9, 0x2a6ed1dceb35e98e, 0xc6f483badc11680f,
-    0x3cfd8c17e9cf12f1, 0x89b83c5e2ea56471, 0xae665cfd24e392a9, 0xec33c4e504cb8915,
-    0x3fb9b15fc9fe7451, 0xd7fd1fd1945f2195, 0x31ade0853443efd8, 0x255efc9863e1e2d2,
-    0x10eab6008d5642cf, 0x46f04863257ac804, 0xa52dc42a789a27d3, 0xdaaadf9ce77af565,
-    0x6b479cd53d87febb, 0x6309e2d3f93db72f, 0xc5738ffbaa1ff9d6, 0x6bd57f3f25af7968,
-    0x67605486d90d0a4a, 0xe14d0b9663bfbdae, 0xb7bbd8d816eb0414, 0xdef8a4f16b35a116,
-    0xe7932d85aaaffed6, 0x08161cbae90cfd48, 0x855507beb294f08b, 0x91234ea6ffd399b2,
-    0xad70cf4b2435f302, 0xd289a97565bc2d27, 0x8e558437ffca99de, 0x96d2704b7115c040,
-    0x0889bbcdfc660e41, 0x5e0d4e67dc92128d, 0x72a9f8917063ed97, 0x438b69d409e016e3,
-    0xdf4fed8a5d8a4397, 0x00f41dcf41d403f7, 0x4814eb038e52603f, 0x9dafbacc58e2d651,
-    0xfe2f458e4be170af, 0x4457ec414df6a940, 0x06e62f1451123314, 0xbd1014d173ba92cc,
-    0xdef318e25ed57760, 0x9fea0de9dfca8525, 0x459de1e76c20624b, 0xaeec189617e2d666,
-    0x126a2c06ab5a83cb, 0xb1321532360f6132, 0x65421503dbb40123, 0x2d67c287ea089ab3,
-    0x6c93bff5a56bd6b6, 0x4ffb2036cab6d98d, 0xce7b785b1be7ad4f, 0xedb42ef6189fd163,
-    0xdc905288703988f6, 0x365f9c1d2c691884, 0xc640583680d99bfe, 0x3cd4624c07593ec6,
-    0x7f1ea8d85d7c5805, 0x014842d480b57149, 0x0b649bcb5a828688, 0xbcd5708ed79b18f0,
-    0xe987c862fbd2f2f0, 0x982731671f0cd82c, 0xbaf13e8b16d8c063, 0x8ea3109cbd951bba,
-    0xd141045bfb385cad, 0x2acbc1a0af1f7d30, 0xe6444d89df03bfdf, 0xa18cc771b8188ff9,
-    0x9834429db01c39bb, 0x214add07fe086a1f, 0x8f07c19b1f6b3ff9, 0x56a297b1bf4ffe55,
-    0x94d558e493c54fc7, 0x40bfc24c764552cb, 0x931a706f8a8520cb, 0x32229d322935bd52,
-    0x2560d0f5dc4fefaf, 0x9dbcc48355969bb6, 0x0fd81c3985c0b56a, 0xe03817e1560f2bda,
-    0xc1bb4f81d892b2d5, 0xb0c4864f4e28d2d7, 0x3ecc49f9d9d6c263, 0x51307e99b52ba65e,
-    0x8af2b688da84a752, 0xf5d72523b91b20b6, 0x6d95ff1ff4634806, 0x562f21555458339a,
-    0xc0ce47f889336346, 0x487823e5089b40d8, 0xe4727c7ebc6d9592, 0x5a8f7277e94970ba,
-    0xfca2f406b1c8bb50, 0x5b1f8a95f1791070, 0xd304af9fc9028605, 0x5440ab7fc930e748,
-    0x312d25fbca2ab5a1, 0x10f4a4b234a4d575, 0x90301d55047e7473, 0x3b6372886c61591e,
-    0x293402b77c444e06, 0x451f34a4d3e97dd7, 0x3158d814d81bc57b, 0x034942425b9bda69,
-    0xe2032ff9e532d9bb, 0x62ae066b8b2179e5, 0x9545e10c2f8d71d8, 0x7ff7483eb2d23fc0,
-    0x00945fcebdc98d86, 0x8764bbbe99b26ca2, 0x1b1ec62284c0bfc3, 0x58e0fcc4f0aa362b,
-    0x5f4abefa878d458d, 0xfd74ac2f9607c519, 0xa4e3fb37df8cbfa9, 0xbf697e43cac574e5,
-    0x86f14a3f68f4cd53, 0x24a23d076f1ce522, 0xe725cd8048868cc8, 0xbf3c729eb2464362,
-    0xd8f6cd57b3cc1ed8, 0x6329e52425541577, 0x62aa688ad5ae1ac0, 0x0a242566269bf845,
-    0x168b1a4753aca74b, 0xf789afefff2e7e3c, 0x6c3362093b6fccdb, 0x4ce8f50bd28c09b2,
-    0x006a2db95ae8aa93, 0x975b0d623c3d1a8c, 0x18605d3935338c5b, 0x5bb6f6136cad3c71,
-    0x0f53a20701f8d8a6, 0xab8c5ad2e7e93c67, 0x40b5ac5127acaa29, 0x8c7bf63c2075895f,
-    0x78bd9f7e014a805c, 0xb2c9e9f4f9c8c032, 0xefd6049827eb91f3, 0x2be459f482c16fbd,
-    0xd92ce0c5745aaa8c, 0x0aaa8fb298d965b9, 0x2b37f92c6c803b15, 0x8c54a5e94e0f0e78,
-    0x95f9b6e90c0a3032, 0xe7939faa436c7874, 0xd16bfe8f6a8a40c9, 0x44982b86263fd2fa,
-    0xe285fb39f984e583, 0x779a8df72d7619d3, 0xf2d79a8de8d5dd1e, 0xd1037354d66684e2,
-    0x004c82a4e668a8e5, 0x31d40a7668b044e6, 0xd70578538bd02c11, 0xdb45431078c5f482,
-    0x977121bb7f6a51ad, 0x73d5ccbd34eff8dd, 0xe437a07d356e17cd, 0x47b2782043c95627,
-    0x9fb251413e41d49a, 0xccd70b60652513d3, 0x1c95b31e8a1b49b2, 0xcae73dfd1bcb4c1b,
-    0x34d98331b1f5b70f, 0x784e39f22338d92f, 0x18613d4a064df420, 0xf1d8dae25f0bcebe,
-    0x33f77c15ae855efc, 0x3c88b3b912eb109c, 0x956a2ec96bafeea5, 0x1aa005b5e0ad0e87,
-    0x5500d70527c4bb8e, 0xe36c57196421cc44, 0x13c4d286cc36ee39, 0x5654a23d818b2a81,
-    0x77b1dc13d161abdc, 0x734f44de5f8d5eb5, 0x60717e174a6c89a2, 0xd47d9649266a211e,
-    0x5b13a4322bb69e90, 0xf7669609f8b5fc3c, 0x21e6ac55bedcdac9, 0x9b56b62b61166dea,
-    0xf48f66b939797e9c, 0x35f332f9c0e6ae9a, 0xcc733f6a9a878db0, 0x3da161e41cc108c2,
-    0xb7d74ae535914d51, 0x4d493b0b11d36469, 0xce264d1dfba9741a, 0xa9d1f2dc7436dc06,
-    0x70738016604c2a27, 0x231d36e96e93f3d5, 0x7666881197838d19, 0x4a2a83090aaad40c,
-    0xf1e761591668b35d, 0x7363236497f730a7, 0x301080e37379dd4d, 0x502dea2971827042,
-    0xc2c5eb858f32625f, 0x786afb9edfafbdff, 0xdaee0d868490b2a4, 0x617366b3268609f6,
-    0xae0e35a0fe46173e, 0xd1a07de93e824f11, 0x079b8b115ea4cca8, 0x93a99274558faebb,
-    0xfb1e6e22e08a03b3, 0xea635fdba3698dd0, 0xcf53659328503a5c, 0xcde3b31e6fd5d780,
-    0x8e3e4221d3614413, 0xef14d0d86bf1a22c, 0xe1d830d3f16c5ddb, 0xaabd2b2a451504e1
-];
+    fn prng_data(seed: u64, len: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            buf.push((s >> 33) as u8);
+        }
+        buf
+    }
+
+    #[test]
+    fn test_palantir_online_exact_duplicate() {
+        let data = prng_data(42, 2 * 1024 * 1024);
+        let sf_gen = PalantirHasher::new(7, vec![4, 3, 2]);
+        let tier_config = TierConfig::new([4, 3, 2]);
+        let lifecycle_configs = LifecycleManager::<3>::default_configs();
+        let mut online = PalantirOnline::new(
+            sf_gen,
+            GdeltaEncoder,
+            tier_config,
+            lifecycle_configs,
+            SearchConfig::default(),
+        );
+
+        online.write(&data).unwrap();
+        let stored_first = online.bytes_stored();
+        assert!(stored_first > 0);
+        assert_eq!(online.delta_chunks_count(), 0);
+
+        online.write(&data).unwrap();
+        assert_eq!(online.bytes_stored(), stored_first);
+        assert_eq!(online.delta_chunks_count(), 0);
+    }
+
+    #[test]
+    fn test_palantir_online_similarity_delta() {
+        let base = prng_data(42, 2 * 1024 * 1024);
+        let mut similar = base.clone();
+        let mut_len = (base.len() * 2) / 100;
+        for b in &mut similar[1024 * 512..1024 * 512 + mut_len] {
+            *b = b.wrapping_add(42);
+        }
+
+        let sf_gen = PalantirHasher::new(7, vec![4, 3, 2]);
+        let tier_config = TierConfig::new([4, 3, 2]);
+        let lifecycle_configs = LifecycleManager::<3>::default_configs();
+        let mut online = PalantirOnline::new(
+            sf_gen,
+            GdeltaEncoder,
+            tier_config,
+            lifecycle_configs,
+            SearchConfig::default(),
+        );
+
+        online.write(&base).unwrap();
+        let base_stored = online.bytes_stored();
+        assert!(base_stored > 0);
+        assert_eq!(online.delta_chunks_count(), 0);
+
+        online.write(&similar).unwrap();
+        assert!(online.delta_chunks_count() > 0);
+        assert!(online.bytes_stored() < base_stored * 2);
+        assert!(online.base_bytes() > 0);
+        assert!(online.delta_bytes() > 0);
+        assert_eq!(online.bytes_stored(), online.base_bytes() + online.delta_bytes());
+
+        // Re-writing similar data (containing deltas) must be completely idempotent:
+        let stored_second = online.bytes_stored();
+        let deltas_second = online.delta_chunks_count();
+        online.write(&similar).unwrap();
+        assert_eq!(
+            online.bytes_stored(),
+            stored_second,
+            "delta re-write must not increase bytes_stored"
+        );
+        assert_eq!(
+            online.delta_chunks_count(),
+            deltas_second,
+            "delta re-write must not increase delta_stored"
+        );
+    }
+
+    #[test]
+    fn test_palantir_online_streaming_matches_slice() {
+        let data = prng_data(42, 2 * 1024 * 1024);
+        let sf_gen = PalantirHasher::new(7, vec![4, 3, 2]);
+
+        let mut online_slice = PalantirOnline::new(
+            sf_gen.clone(),
+            GdeltaEncoder,
+            TierConfig::new([4, 3, 2]),
+            LifecycleManager::<3>::default_configs(),
+            SearchConfig::default(),
+        );
+        let mut online_stream = PalantirOnline::new(
+            sf_gen,
+            GdeltaEncoder,
+            TierConfig::new([4, 3, 2]),
+            LifecycleManager::<3>::default_configs(),
+            SearchConfig::default(),
+        );
+
+        online_slice.write(&data).unwrap();
+        online_stream.write_stream(Cursor::new(&data)).unwrap();
+
+        assert_eq!(online_slice.bytes_stored(), online_stream.bytes_stored());
+        assert_eq!(online_slice.chunks_processed(), online_stream.chunks_processed());
+        assert!(online_slice.chunks_processed() > 0);
+    }
+
+    fn new_online() -> PalantirOnline<PalantirHasher, [u8; 32], GdeltaEncoder, 3> {
+        PalantirOnline::new(
+            PalantirHasher::new(7, vec![4, 3, 2]),
+            GdeltaEncoder,
+            TierConfig::new([4, 3, 2]),
+            LifecycleManager::<3>::default_configs(),
+            SearchConfig::default(),
+        )
+    }
+
+    #[test]
+    fn logical_bytes_counts_every_processed_byte() {
+        let first = prng_data(1, 3 * 1024 * 1024);
+        let second = prng_data(2, 1024 * 1024 + 12_345);
+        let mut online = new_online();
+
+        online.write(&first).unwrap();
+        online.write(&second).unwrap();
+        let total = (first.len() + second.len()) as u64;
+        assert_eq!(online.logical_bytes(), total);
+
+        let stored = online.bytes_stored();
+        online.write(&first).unwrap();
+        online.write(&second).unwrap();
+        assert_eq!(online.logical_bytes(), 2 * total, "duplicates count as logical bytes");
+        assert_eq!(online.bytes_stored(), stored, "duplicates must not be stored again");
+    }
+
+    #[test]
+    fn logical_bytes_streaming_matches_slice() {
+        let data = prng_data(3, 5 * 1024 * 1024 + 777);
+        let mut online_slice = new_online();
+        let mut online_stream = new_online();
+
+        online_slice.write(&data).unwrap();
+        online_stream.write_stream(Cursor::new(&data)).unwrap();
+
+        assert_eq!(online_slice.logical_bytes(), data.len() as u64);
+        assert_eq!(online_stream.logical_bytes(), data.len() as u64);
+    }
+
+    #[test]
+    fn index_desync_is_fatal_and_poisons_instance() {
+        let chunk = prng_data(4, CHUNK_MIN_SIZE + 64 * 1024);
+        let sf_raw = collect_raw_features(&chunk, CHUNK_MIN_SIZE);
+        let mut online = new_online();
+        online.write(&prng_data(6, 3 * 1024 * 1024)).unwrap();
+        let super_features = online.sf_gen.generate_from_raw(&sf_raw);
+
+        // Similarity index points at a hash that was never stored in `db`.
+        let ghost_hash = *blake3::hash(b"ghost base").as_bytes();
+        assert!(!online.db.contains(&ghost_hash));
+        online.metadata_manager.add_block(ghost_hash, &super_features, BlockID::new(ghost_hash));
+
+        let chunk_hash = *blake3::hash(&chunk).as_bytes();
+        let snapshot = |db: &MetricsDatabase<[u8; 32]>| {
+            (
+                db.base_bytes(),
+                db.delta_bytes(),
+                db.unique_chunks_count(),
+                db.delta_chunks_count(),
+                db.delta_bases().len(),
+            )
+        };
+        let before = snapshot(&online.db);
+
+        assert!(!online.is_poisoned());
+        let err = online.process_chunk(&chunk, sf_raw).unwrap_err();
+        assert!(online.is_poisoned());
+        assert!(matches!(err, PalantirError::MetadataError(ref m) if m.contains("index desync")));
+        assert!(!online.db.contains(&chunk_hash), "failed chunk must not be stored");
+        assert_eq!(snapshot(&online.db), before, "db must not change on index desync");
+
+        // Poisoned: every further write is rejected without touching the store.
+        let err = online.write(&prng_data(8, 2 * 1024 * 1024)).unwrap_err();
+        assert!(matches!(err, PalantirError::MetadataError(ref m) if m.contains("poisoned")));
+        let err = online.write_stream(Cursor::new(prng_data(9, 1024))).unwrap_err();
+        assert!(matches!(err, PalantirError::MetadataError(_)));
+        assert_eq!(snapshot(&online.db), before);
+    }
+
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated I/O failure"))
+        }
+    }
+
+    #[test]
+    fn io_error_does_not_poison_instance() {
+        let mut online = new_online();
+        let err = online.write_stream(FailingReader).unwrap_err();
+        assert!(!online.is_poisoned());
+        assert!(matches!(err, PalantirError::ChunkError(_)));
+
+        let data = prng_data(10, 3 * 1024 * 1024);
+        online.write(&data).unwrap();
+        assert!(!online.is_poisoned());
+        assert!(online.bytes_stored() > 0);
+        assert_eq!(online.logical_bytes(), data.len() as u64);
+    }
+
+    #[test]
+    fn test_palantir_online_manifest_configuration_and_lifecycle() {
+        let base = prng_data(42, 2 * 1024 * 1024);
+        let mut similar = base.clone();
+        let mut_len = (base.len() * 2) / 100;
+        for b in &mut similar[1024 * 512..1024 * 512 + mut_len] {
+            *b = b.wrapping_add(42);
+        }
+
+        let sf_gen = PalantirHasher::new(7, vec![4, 3, 2]);
+        let mut online = PalantirOnline::new(
+            sf_gen,
+            GdeltaEncoder,
+            TierConfig::new([4, 3, 2]),
+            LifecycleManager::<3>::default_configs(),
+            SearchConfig::default(),
+        )
+        .with_manifests(true);
+
+        assert!(online.manifests_enabled());
+        assert_eq!(online.manifests_count(), 0);
+
+        // Write base: manifests should be automatically created for large base chunks
+        online.write(&base).unwrap();
+        assert!(online.manifests_count() > 0, "Manifests must be generated when enabled");
+
+        // Collect hashes of stored manifests
+        let manifest_hashes: Vec<[u8; 32]> = online.manifests.keys().cloned().collect();
+        let target_hash = manifest_hashes[0];
+        assert!(online.has_manifest(&target_hash));
+        assert!(online.manifest(&target_hash).is_some());
+
+        // Test removing a manifest ("убирать")
+        let removed = online.remove_manifest(&target_hash);
+        assert!(removed.is_some(), "Manifest must be removed");
+        assert!(!online.has_manifest(&target_hash));
+
+        // Test generating manifest back on demand ("добавлять")
+        assert!(online.generate_manifest_for(&target_hash));
+        assert!(online.has_manifest(&target_hash));
+
+        // Write similar: delta encoding works with manifest
+        online.write(&similar).unwrap();
+        assert!(online.delta_chunks_count() > 0);
+
+        // Test disabling manifests dynamically
+        online.set_manifests_enabled(false);
+        assert!(!online.manifests_enabled());
+
+        // Clear all manifests
+        online.clear_manifests();
+        assert_eq!(online.manifests_count(), 0);
+
+        // Even with manifests cleared, delta encoding falls back to encode() smoothly
+        let mut similar2 = base.clone();
+        for b in &mut similar2[1024 * 512..1024 * 512 + mut_len] {
+            *b = b.wrapping_add(43);
+        }
+        online.write(&similar2).unwrap();
+        assert!(
+            online.delta_chunks_count() > 1,
+            "Delta encoding must work without manifests via fallback"
+        );
+    }
+}

@@ -4,7 +4,8 @@ use marline_index::heuristic_index::SearchConfig;
 use marline_palantir::encoder::GdeltaEncoder;
 use marline_palantir::lifecycle_manager::LifecycleManager;
 use marline_palantir::metadata_manager::MetadataManager;
-use marline_palantir::palantir_scrubber::PalantirScrubber;
+use marline_palantir::mock_rocksdb::Entry;
+use marline_palantir::palantir_scrubber::{get_manifest, PalantirScrubber};
 use marline_palantir::sf_generator::{PalantirHasher, SuperFeatureGenerator};
 use marline_palantir::types::{BlockID, Chunk, TierConfig};
 use marline_storage::{Data, DataContainer, Database, InMemoryDatabase};
@@ -149,4 +150,115 @@ fn test_delta_chain_depth_limit() {
         marline_palantir::palantir_scrubber::get_manifest(&manifest_base, &delta_bases, &[0u8; 32]);
     assert!(res.is_err());
     assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn test_find_root_multi_node_cycle_detection() {
+    let mut delta_bases = HashMap::new();
+    let hash_a = [1u8; 32];
+    let hash_b = [2u8; 32];
+    // Create 2-node cycle A -> B -> A
+    delta_bases.insert(hash_a, hash_b);
+    delta_bases.insert(hash_b, hash_a);
+
+    let res = marline_palantir::palantir_scrubber::find_root(&delta_bases, &hash_a);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("cycle detected"));
+}
+
+#[test]
+fn test_find_root_self_loop_cycle_detection() {
+    let mut delta_bases = HashMap::new();
+    let hash_a = [1u8; 32];
+    // Create self-loop A -> A
+    delta_bases.insert(hash_a, hash_a);
+
+    let res = marline_palantir::palantir_scrubber::find_root(&delta_bases, &hash_a);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("cycle detected"));
+}
+
+#[test]
+fn test_find_root_three_node_cycle_detection() {
+    let mut delta_bases = HashMap::new();
+    let hash_a = [1u8; 32];
+    let hash_b = [2u8; 32];
+    let hash_c = [3u8; 32];
+    // Create 3-node cycle A -> B -> C -> A
+    delta_bases.insert(hash_a, hash_b);
+    delta_bases.insert(hash_b, hash_c);
+    delta_bases.insert(hash_c, hash_a);
+
+    let res = marline_palantir::palantir_scrubber::find_root(&delta_bases, &hash_a);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("cycle detected"));
+}
+
+/// Must stay in sync with `MAX_CHAIN_DEPTH` in `palantir_scrubber`.
+const MAX_CHAIN_DEPTH: usize = 1024;
+
+fn node_hash(i: u64) -> [u8; 32] {
+    hash_data(&i.to_le_bytes())
+}
+
+/// Builds a linear chain `node(0) -> node(1) -> ... -> node(edges)`; returns `(map, root)`.
+fn linear_chain(edges: usize) -> (HashMap<[u8; 32], [u8; 32]>, [u8; 32]) {
+    let mut delta_bases = HashMap::with_capacity(edges);
+    for i in 0..edges as u64 {
+        delta_bases.insert(node_hash(i), node_hash(i + 1));
+    }
+    (delta_bases, node_hash(edges as u64))
+}
+
+#[test]
+fn find_root_returns_start_when_absent_from_map() {
+    let (delta_bases, _) = linear_chain(3);
+    let start = node_hash(1_000_000);
+    let res = marline_palantir::palantir_scrubber::find_root(&delta_bases, &start).unwrap();
+    assert_eq!(res, start);
+}
+
+#[test]
+fn find_root_resolves_short_chain() {
+    let (delta_bases, root) = linear_chain(2);
+    let res = marline_palantir::palantir_scrubber::find_root(&delta_bases, &node_hash(0)).unwrap();
+    assert_eq!(res, root);
+}
+
+#[test]
+fn find_root_accepts_chain_of_max_depth() {
+    let (delta_bases, root) = linear_chain(MAX_CHAIN_DEPTH);
+    let res = marline_palantir::palantir_scrubber::find_root(&delta_bases, &node_hash(0)).unwrap();
+    assert_eq!(res, root);
+}
+
+#[test]
+fn find_root_rejects_chain_exceeding_max_depth() {
+    let (delta_bases, _) = linear_chain(MAX_CHAIN_DEPTH + 1);
+    let err =
+        marline_palantir::palantir_scrubber::find_root(&delta_bases, &node_hash(0)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn walk_to_root_depth_limit_matches_find_root() {
+    let (delta_bases, root) = linear_chain(MAX_CHAIN_DEPTH);
+    let mut manifest_base = InMemoryDatabase::new();
+    let root_data = hash_data(b"root payload").to_vec();
+    manifest_base.insert(root, Entry::from(root_data.clone())).unwrap();
+
+    let (data, manifest) = get_manifest(&manifest_base, &delta_bases, &node_hash(0)).unwrap();
+    assert_eq!(data, &root_data);
+    assert!(manifest.is_none());
+
+    let (delta_bases, root) = linear_chain(MAX_CHAIN_DEPTH + 1);
+    manifest_base.insert(root, Entry::from(root_data)).unwrap();
+    let err = get_manifest(&manifest_base, &delta_bases, &node_hash(0)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }

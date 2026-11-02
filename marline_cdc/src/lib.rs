@@ -171,7 +171,7 @@ mod tests {
             let length = slice_chunk.length;
 
             assert_eq!(offset, stream_chunk.offset as usize, "Offset mismatch");
-            assert_eq!(length, stream_chunk.length as usize, "Length mismatch");
+            assert_eq!(length, stream_chunk.length, "Length mismatch");
             assert_eq!(slice_chunk.hash, stream_chunk.hash, "Hash mismatch");
             assert_eq!(slice_feat, stream_feat, "Extracted features mismatch");
             assert_eq!(

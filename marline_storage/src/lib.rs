@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::io;
 
@@ -158,15 +158,22 @@ impl<K: ChunkHash, V: Clone> IterableDatabase<K, V> for InMemoryDatabase<K, V> {
     }
 }
 
+/// Metrics-oriented chunk store.
+///
+/// Keeps raw payloads of unique base chunks and a single delta index
+/// (delta hash → root base hash). Delta payloads are accounted for in metrics
+/// but not kept in RAM.
 #[derive(Debug, Clone)]
 pub struct MetricsDatabase<H: ChunkHash = [u8; 32]> {
-    total_saved_bytes: usize,
+    base_bytes: usize,
+    delta_bytes: usize,
     unique_chunks_count: usize,
     delta_chunks_count: usize,
     /// Stores unique base chunks for subsequent delta encoding references.
     base_chunks: HashMap<H, Vec<u8>>,
-    /// Tracks seen delta hashes to guarantee metric idempotency.
-    seen_deltas: HashSet<H>,
+    /// Delta index: delta chunk hash → hash of the base chunk it was encoded against.
+    /// Also guarantees metric idempotency for repeated delta inserts.
+    delta_bases: HashMap<H, H>,
 }
 
 impl<H: ChunkHash> Default for MetricsDatabase<H> {
@@ -178,16 +185,29 @@ impl<H: ChunkHash> Default for MetricsDatabase<H> {
 impl<H: ChunkHash> MetricsDatabase<H> {
     pub fn new() -> Self {
         Self {
-            total_saved_bytes: 0,
+            base_bytes: 0,
+            delta_bytes: 0,
             unique_chunks_count: 0,
             delta_chunks_count: 0,
             base_chunks: HashMap::new(),
-            seen_deltas: HashSet::new(),
+            delta_bases: HashMap::new(),
         }
     }
 
+    /// Raw uncompressed bytes stored for unique base chunks.
+    pub fn base_bytes(&self) -> usize {
+        self.base_bytes
+    }
+
+    /// Compressed bytes accounted for delta chunks.
+    pub fn delta_bytes(&self) -> usize {
+        self.delta_bytes
+    }
+
+    /// Total bytes that would be stored:
+    /// raw bytes for unique base chunks + compressed bytes for delta chunks.
     pub fn total_saved_bytes(&self) -> usize {
-        self.total_saved_bytes
+        self.base_bytes + self.delta_bytes
     }
 
     pub fn unique_chunks_count(&self) -> usize {
@@ -200,23 +220,46 @@ impl<H: ChunkHash> MetricsDatabase<H> {
 
     /// Preserving the unique base chunk (storing the body + monitoring its size).
     ///
-    /// Idempotent: inserting an already existing hash does not increase `total_saved_bytes` or `unique_chunks_count`.
+    /// Idempotent: inserting an already existing hash (as base or delta) does not increase metrics.
     pub fn insert(&mut self, hash: H, data: &[u8]) {
+        if self.delta_bases.contains_key(&hash) {
+            return;
+        }
         if let Entry::Vacant(entry) = self.base_chunks.entry(hash) {
-            self.total_saved_bytes += data.len();
+            self.base_bytes += data.len();
             self.unique_chunks_count += 1;
             entry.insert(data.to_vec());
         }
     }
 
-    /// Storing the delta (we only account for the size of the compressed delta, saving RAM).
+    /// Records a delta chunk encoded against `base` for metrics accounting.
     ///
-    /// Idempotent: inserting an already existing delta hash does not increase `total_saved_bytes` or `delta_chunks_count`.
-    pub fn insert_delta(&mut self, hash: H, delta: &[u8]) {
-        if self.seen_deltas.insert(hash) {
-            self.total_saved_bytes += delta.len();
-            self.delta_chunks_count += 1;
+    /// Returns `false` and records nothing if `base` is not a stored base chunk
+    /// or `hash` is already known (as base or delta).
+    ///
+    /// # Note
+    /// This store is metrics-oriented and does NOT persist delta payload bytes in RAM.
+    /// Since `base` must be a stored base chunk and base/delta hashes never overlap,
+    /// self-loops and delta-to-delta links are rejected, keeping the index flat.
+    #[must_use]
+    pub fn insert_delta(&mut self, hash: H, base: H, delta: &[u8]) -> bool {
+        if self.base_chunks.contains_key(&hash) || !self.base_chunks.contains_key(&base) {
+            return false;
         }
+        match self.delta_bases.entry(hash) {
+            Entry::Vacant(entry) => {
+                entry.insert(base);
+                self.delta_bytes += delta.len();
+                self.delta_chunks_count += 1;
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Read-only view of the delta index (delta hash → base hash).
+    pub fn delta_bases(&self) -> &HashMap<H, H> {
+        &self.delta_bases
     }
 
     /// Obtaining a reference to a base chunk without unnecessary cloning.
@@ -225,13 +268,15 @@ impl<H: ChunkHash> MetricsDatabase<H> {
     }
 
     pub fn contains(&self, hash: &H) -> bool {
-        self.base_chunks.contains_key(hash)
+        self.base_chunks.contains_key(hash) || self.delta_bases.contains_key(hash)
     }
 
+    /// Number of stored base chunks (delta chunks are not counted).
     pub fn len(&self) -> usize {
         self.base_chunks.len()
     }
 
+    /// Whether no base chunks are stored (delta chunks are not counted).
     pub fn is_empty(&self) -> bool {
         self.base_chunks.is_empty()
     }
@@ -389,15 +434,18 @@ mod tests {
         // Insert delta chunk
         let delta_hash = make_hash(3);
         let delta_payload = vec![0x11; 512];
-        db.insert_delta(delta_hash, &delta_payload);
+        assert!(db.insert_delta(delta_hash, hash1, &delta_payload));
         assert_eq!(db.delta_chunks_count(), 1);
+        assert_eq!(db.delta_bases().get(&delta_hash), Some(&hash1));
+        assert_eq!(db.base_bytes(), 3 * KB);
+        assert_eq!(db.delta_bytes(), 512);
         assert_eq!(db.total_saved_bytes(), 3 * KB + 512);
         assert_eq!(db.len(), 2, "Delta chunks are not stored in base_chunks map");
-        assert!(!db.contains(&delta_hash));
+        assert!(db.contains(&delta_hash), "contains checks both base chunks and seen deltas");
         assert_eq!(db.get_ref(&delta_hash), None);
 
         // Repeated insert_delta with the same hash - MUST BE IDEMPOTENT
-        db.insert_delta(delta_hash, &delta_payload);
+        assert!(!db.insert_delta(delta_hash, hash1, &delta_payload));
         assert_eq!(
             db.delta_chunks_count(),
             1,
@@ -411,7 +459,12 @@ mod tests {
 
         // Repeated insert_delta with same hash but different payload - still idempotent
         let diff_delta = vec![0x22; 1024];
-        db.insert_delta(delta_hash, &diff_delta);
+        assert!(!db.insert_delta(delta_hash, hash2, &diff_delta));
+        assert_eq!(
+            db.delta_bases().get(&delta_hash),
+            Some(&hash1),
+            "repeated insert_delta with a different base must not overwrite the original base"
+        );
         assert_eq!(
             db.delta_chunks_count(),
             1,
@@ -422,6 +475,64 @@ mod tests {
             3 * KB + 512,
             "total_saved_bytes must not increase on duplicate delta insert with different payload"
         );
+
+        // Cross-idempotency: inserting already-seen delta as a base chunk MUST BE A NO-OP
+        db.insert(delta_hash, &vec![0x33; 2048]);
+        assert_eq!(db.len(), 2, "delta hash must not be inserted into base_chunks");
+        assert_eq!(db.unique_chunks_count(), 2, "unique_chunks_count must not increase");
+        assert_eq!(db.total_saved_bytes(), 3 * KB + 512, "total_saved_bytes must not increase");
+
+        // Cross-idempotency: inserting already-existing base as a delta MUST BE A NO-OP
+        assert!(!db.insert_delta(hash1, hash2, &vec![0x44; 256]));
+        assert!(
+            !db.delta_bases().contains_key(&hash1),
+            "existing base must not enter the delta index"
+        );
+        assert_eq!(
+            db.delta_chunks_count(),
+            1,
+            "delta_chunks_count must not increase for existing base chunk"
+        );
+        assert_eq!(
+            db.total_saved_bytes(),
+            3 * KB + 512,
+            "total_saved_bytes must not increase for existing base chunk"
+        );
+    }
+
+    #[test]
+    fn test_metrics_db_insert_delta_rejects_invalid_base() {
+        let mut db: MetricsDatabase<[u8; 32]> = MetricsDatabase::new();
+        let base = make_hash(1);
+        let delta = make_hash(2);
+        let dangling = make_hash(3);
+        let other = make_hash(4);
+        let payload = [0x5Au8; 300];
+
+        db.insert(base, &[0xA5; KB]);
+        let snapshot = |db: &MetricsDatabase<[u8; 32]>| {
+            (db.delta_bytes(), db.delta_chunks_count(), db.delta_bases().len())
+        };
+
+        // Dangling base: not stored at all.
+        let before = snapshot(&db);
+        assert!(!db.insert_delta(other, dangling, &payload), "dangling base must be rejected");
+        assert_eq!(snapshot(&db), before, "rejected insert must not change metrics");
+        assert!(!db.contains(&other));
+
+        // Base that is itself a delta: delta-to-delta links are rejected.
+        assert!(db.insert_delta(delta, base, &payload));
+        let before = snapshot(&db);
+        assert!(!db.insert_delta(other, delta, &payload), "delta as base must be rejected");
+        assert_eq!(snapshot(&db), before);
+        assert!(!db.contains(&other));
+
+        // Self-loop: hash == base, both for unknown and stored hashes.
+        assert!(!db.insert_delta(other, other, &payload), "self-loop must be rejected");
+        assert!(!db.insert_delta(base, base, &payload), "self-loop on base must be rejected");
+        assert!(!db.insert_delta(delta, delta, &payload), "self-loop on delta must be rejected");
+        assert_eq!(snapshot(&db), before);
+        assert_eq!(db.delta_bases().get(&delta), Some(&base));
     }
 
     // =========================================================================

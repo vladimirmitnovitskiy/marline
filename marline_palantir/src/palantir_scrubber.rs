@@ -245,6 +245,48 @@ fn walk_to_root(
     Ok((cur, chain))
 }
 
+/// Returns only the root hash without allocating chain vectors or seen sets.
+/// Uses Floyd's cycle-finding algorithm to detect cycles of any length in O(1) space.
+///
+/// The depth limit matches [`walk_to_root`]: the fast pointer traverses at most
+/// `MAX_CHAIN_DEPTH` (1024) edges, so acyclic chains of up to 1024 edges resolve
+/// to `Ok(root)`, while longer chains return `ErrorKind::InvalidData`.
+pub fn find_root<H: Copy + Eq + std::hash::Hash>(
+    delta_bases: &HashMap<H, H>,
+    start: &H,
+) -> io::Result<H> {
+    let mut slow = *start;
+    let mut fast = *start;
+    for _ in 0..MAX_CHAIN_DEPTH.div_ceil(2) {
+        // slow pointer: 1 step
+        match delta_bases.get(&slow) {
+            Some(&base) => slow = base,
+            None => return Ok(slow),
+        }
+        // fast pointer: 2 steps
+        for _ in 0..2 {
+            match delta_bases.get(&fast) {
+                Some(&base) => fast = base,
+                None => return Ok(fast),
+            }
+        }
+        if slow == fast {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cycle detected in delta chain",
+            ));
+        }
+    }
+    // `fast` has traversed exactly `MAX_CHAIN_DEPTH` edges: a chain of that length is valid.
+    if !delta_bases.contains_key(&fast) {
+        return Ok(fast);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("delta chain exceeded maximum depth {}", MAX_CHAIN_DEPTH),
+    ))
+}
+
 pub type ManifestData<'a> = (&'a Vec<u8>, &'a Option<HashMap<u64, u32>>);
 
 /// Retrieves base chunk data and optional manifest by resolving the delta chain to its root.
@@ -262,22 +304,6 @@ pub fn get_manifest<'a>(
         io::Error::new(io::ErrorKind::NotFound, "base chunk not found in manifest_base")
     })?;
     Ok((entry.get_data(), entry.get_manifest()))
-}
-
-/// Retrieves a mutable reference to the root entry by resolving the delta chain.
-///
-/// # Errors
-/// * Returns `ErrorKind::InvalidData` if a cycle is detected or depth exceeds `MAX_CHAIN_DEPTH`.
-/// * Returns `ErrorKind::NotFound` if the root entry is missing from `manifest_base`.
-pub(crate) fn get_entry<'a>(
-    manifest_base: &'a mut InMemoryDatabase<[u8; 32], Entry>,
-    delta_bases: &HashMap<[u8; 32], [u8; 32]>,
-    hash: &[u8; 32],
-) -> io::Result<&'a mut Entry> {
-    let (cur, _chain) = walk_to_root(delta_bases, hash)?;
-    manifest_base.get_mut(&cur).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "base chunk not found in manifest_base")
-    })
 }
 
 /// Decodes a chunk by walking its delta chain back to the root and reconstructing data.
