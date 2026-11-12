@@ -5,7 +5,7 @@ use crate::metadata_manager::MetadataManager;
 use crate::palantir_scrubber::find_root;
 use crate::sf_generator::SuperFeatureGenerator;
 use crate::types::{BlockID, TierConfig};
-use marline_cdc::{collect_raw_features, FastCDC, StreamCDC};
+use marline_cdc::{collect_raw_features, ChunkerBuilder};
 use marline_index::heuristic_index::SearchConfig;
 use marline_storage::{ChunkHash, MetricsDatabase};
 use std::collections::HashMap;
@@ -13,10 +13,6 @@ use std::collections::HashMap;
 fn zstd_error(code: zstd::zstd_safe::ErrorCode) -> PalantirError {
     PalantirError::ChunkError(zstd::zstd_safe::get_error_name(code).to_owned())
 }
-
-/// Minimum chunk size used by the online chunker; also the start of the
-/// feature-collection window inside each chunk.
-pub const CHUNK_MIN_SIZE: usize = 1024 * 512;
 
 pub trait OnlineSBC<S, H: ChunkHash, E, const N: usize> {
     fn write(&mut self, data: &[u8]) -> Result<(), PalantirError>;
@@ -82,14 +78,15 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize>
             return Ok(());
         }
 
-        // Защита от ложных совпадений: если чанк <= CHUNK_MIN_SIZE, feature-окно пусто, сохраняем как base
-        if chunk_data.len() <= CHUNK_MIN_SIZE {
+        let min_size = ChunkerBuilder::default().min_size();
+        // Защита от ложных совпадений: если чанк <= min_size, feature-окно пусто, сохраняем как base
+        if chunk_data.len() <= min_size {
             self.db.insert(hash, chunk_data);
             return Ok(());
         }
 
         let super_features = if self.naive {
-            let sf = collect_raw_features(chunk_data, CHUNK_MIN_SIZE);
+            let sf = collect_raw_features(chunk_data, min_size);
             debug_assert_eq!(sf, sf_raw, "two-pass features must equal in-pass");
             self.sf_gen.generate_from_raw(&sf)
         } else {
@@ -196,7 +193,7 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize> OnlineSBC<S, 
     ///   stays usable and chunks processed before the error remain stored.
     fn write(&mut self, data: &[u8]) -> Result<(), PalantirError> {
         self.ensure_not_poisoned()?;
-        let chunker = FastCDC::new(data, CHUNK_MIN_SIZE, 1024 * 1024, 2 * 1024 * 1024);
+        let chunker = ChunkerBuilder::default().chunker(data);
         for (chunk, sf_raw) in chunker {
             let chunk_data = chunk
                 .offset
@@ -218,7 +215,7 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize> OnlineSBC<S, 
     ///   stays usable and chunks processed before the error remain stored.
     fn write_stream<R: std::io::Read>(&mut self, reader: R) -> Result<(), PalantirError> {
         self.ensure_not_poisoned()?;
-        let chunker = StreamCDC::new(reader, CHUNK_MIN_SIZE, 1024 * 1024, 2 * 1024 * 1024);
+        let chunker = ChunkerBuilder::default().stream_chunker(reader);
         for result in chunker {
             let (chunk, sf_raw) = result.map_err(|e| PalantirError::ChunkError(e.to_string()))?;
             self.process_chunk(&chunk.data, sf_raw)?;
@@ -516,8 +513,9 @@ mod tests {
 
     #[test]
     fn index_desync_is_fatal_and_poisons_instance() {
-        let chunk = prng_data(4, CHUNK_MIN_SIZE + 64 * 1024);
-        let sf_raw = collect_raw_features(&chunk, CHUNK_MIN_SIZE);
+        let min_size = ChunkerBuilder::default().min_size();
+        let chunk = prng_data(4, min_size + 64 * 1024);
+        let sf_raw = collect_raw_features(&chunk, min_size);
         let mut online = new_online();
         online.write(&prng_data(6, 3 * 1024 * 1024)).unwrap();
         let super_features = online.sf_gen.generate_from_raw(&sf_raw);
