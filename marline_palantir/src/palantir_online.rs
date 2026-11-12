@@ -22,6 +22,8 @@ pub trait OnlineSBC<S, H: ChunkHash, E, const N: usize> {
 
 pub struct PalantirOnline<S, H: ChunkHash, E: PalantirEncoder, const N: usize> {
     sf_gen: S,
+    /// Chunk size parameters; the minimum size also starts the feature-collection window.
+    builder: ChunkerBuilder,
     /// Multi-tier similarity index.
     metadata_manager: MetadataManager<H, N>,
     /// Delta encoder.
@@ -78,15 +80,14 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize>
             return Ok(());
         }
 
-        let min_size = ChunkerBuilder::default().min_size();
         // Защита от ложных совпадений: если чанк <= min_size, feature-окно пусто, сохраняем как base
-        if chunk_data.len() <= min_size {
+        if chunk_data.len() <= self.builder.min_size() {
             self.db.insert(hash, chunk_data);
             return Ok(());
         }
 
         let super_features = if self.naive {
-            let sf = collect_raw_features(chunk_data, min_size);
+            let sf = collect_raw_features(chunk_data, self.builder.min_size());
             debug_assert_eq!(sf, sf_raw, "two-pass features must equal in-pass");
             self.sf_gen.generate_from_raw(&sf)
         } else {
@@ -193,7 +194,7 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize> OnlineSBC<S, 
     ///   stays usable and chunks processed before the error remain stored.
     fn write(&mut self, data: &[u8]) -> Result<(), PalantirError> {
         self.ensure_not_poisoned()?;
-        let chunker = ChunkerBuilder::default().chunker(data);
+        let chunker = self.builder.chunker(data);
         for (chunk, sf_raw) in chunker {
             let chunk_data = chunk
                 .offset
@@ -215,7 +216,7 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize> OnlineSBC<S, 
     ///   stays usable and chunks processed before the error remain stored.
     fn write_stream<R: std::io::Read>(&mut self, reader: R) -> Result<(), PalantirError> {
         self.ensure_not_poisoned()?;
-        let chunker = ChunkerBuilder::default().stream_chunker(reader);
+        let chunker = self.builder.stream_chunker(reader);
         for result in chunker {
             let (chunk, sf_raw) = result.map_err(|e| PalantirError::ChunkError(e.to_string()))?;
             self.process_chunk(&chunk.data, sf_raw)?;
@@ -238,6 +239,7 @@ impl<S, H: ChunkHash, E: PalantirEncoder, const N: usize> PalantirOnline<S, H, E
     ) -> Self {
         Self {
             sf_gen,
+            builder: ChunkerBuilder::default(),
             metadata_manager: MetadataManager::new(tier_config, lifecycle_configs, &search_config),
             encoder,
             fp_threshold: 0.9,
