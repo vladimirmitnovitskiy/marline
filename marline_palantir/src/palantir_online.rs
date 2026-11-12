@@ -15,7 +15,6 @@ use std::collections::HashMap;
 
 /// Minimum chunk size used by the online chunker; also the start of the
 /// feature-collection window inside each chunk.
-pub const CHUNK_MIN_SIZE: usize = 1024 * 512;
 
 pub trait OnlineSBC<S, H: ChunkHash, E, const N: usize> {
     fn write(&mut self, data: &[u8]) -> Result<(), PalantirError>;
