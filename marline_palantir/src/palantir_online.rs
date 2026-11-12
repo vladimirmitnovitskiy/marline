@@ -12,8 +12,6 @@ use marline_index::heuristic_index::SearchConfig;
 use marline_storage::{ChunkHash, Database};
 use std::collections::HashMap;
 
-
-/// Minimum chunk size used by the online chunker; also the start of the
 /// feature-collection window inside each chunk.
 
 pub trait OnlineSBC<S, H: ChunkHash, E, const N: usize> {
