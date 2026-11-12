@@ -80,7 +80,8 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize>
             return Ok(());
         }
 
-        // Защита от ложных совпадений: если чанк <= min_size, feature-окно пусто, сохраняем как base
+        // False-match guard: a chunk of at most `min_size` bytes has an empty feature window,
+        // so it is stored as a base chunk.
         if chunk_data.len() <= self.builder.min_size() {
             self.db.insert(hash, chunk_data);
             return Ok(());
@@ -88,7 +89,7 @@ impl<S: SuperFeatureGenerator, E: PalantirEncoder, const N: usize>
 
         let super_features = if self.naive {
             let sf = collect_raw_features(chunk_data, self.builder.min_size());
-            debug_assert_eq!(sf, sf_raw, "two-pass features must equal in-pass");
+            debug_assert!(sf == sf_raw, "two-pass features must equal in-pass");
             self.sf_gen.generate_from_raw(&sf)
         } else {
             self.sf_gen.generate_from_raw(&sf_raw)
