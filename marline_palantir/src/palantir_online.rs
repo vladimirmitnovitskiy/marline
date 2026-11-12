@@ -12,8 +12,6 @@ use marline_index::heuristic_index::SearchConfig;
 use marline_storage::{ChunkHash, Database};
 use std::collections::HashMap;
 
-/// feature-collection window inside each chunk.
-
 pub trait OnlineSBC<S, H: ChunkHash, E, const N: usize> {
     fn write(&mut self, data: &[u8]) -> Result<(), PalantirError>;
 
