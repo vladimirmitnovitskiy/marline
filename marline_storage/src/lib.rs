@@ -249,7 +249,7 @@ impl<H: ChunkHash> MetricsDatabase<H> {
         self.unique_chunks_count
     }
 
-    /// Number of unique deltas stored.
+    /// Number of unique deltas recorded (their payloads are not kept).
     pub fn delta_chunks_count(&self) -> usize {
         self.delta_chunks_count
     }
@@ -303,7 +303,7 @@ impl<H: ChunkHash> MetricsDatabase<H> {
         self.base_chunks.get(hash).map(|v| v.as_slice())
     }
 
-    /// Whether a base chunk with `hash` is stored (deltas are not counted).
+    /// Whether `hash` is known, either as a stored base chunk or as a recorded delta.
     pub fn contains(&self, hash: &H) -> bool {
         self.base_chunks.contains_key(hash) || self.delta_bases.contains_key(hash)
     }
