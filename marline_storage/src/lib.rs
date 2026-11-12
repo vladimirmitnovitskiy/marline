@@ -191,6 +191,10 @@ impl<K: ChunkHash, V: Clone> IterableDatabase<K, V> for InMemoryDatabase<K, V> {
     }
 }
 
+/// Chunk store that keeps unique base chunks and accounts for the physical size of stored data.
+///
+/// Base chunks are kept in full so they can serve as delta-encoding references; deltas
+/// are only accounted for (their bytes are not retained).
 #[derive(Debug, Clone)]
 pub struct MetricsDatabase<H: ChunkHash = [u8; 32]> {
     total_saved_bytes: usize,
@@ -209,6 +213,7 @@ impl<H: ChunkHash> Default for MetricsDatabase<H> {
 }
 
 impl<H: ChunkHash> MetricsDatabase<H> {
+    /// Creates an empty store with zeroed metrics.
     pub fn new() -> Self {
         Self {
             total_saved_bytes: 0,
@@ -219,19 +224,22 @@ impl<H: ChunkHash> MetricsDatabase<H> {
         }
     }
 
+    /// Total bytes of all unique base chunks and deltas stored so far.
     pub fn total_saved_bytes(&self) -> usize {
         self.total_saved_bytes
     }
 
+    /// Number of unique base chunks stored.
     pub fn unique_chunks_count(&self) -> usize {
         self.unique_chunks_count
     }
 
+    /// Number of unique deltas stored.
     pub fn delta_chunks_count(&self) -> usize {
         self.delta_chunks_count
     }
 
-    /// Preserving the unique base chunk (storing the body + monitoring its size).
+    /// Stores a unique base chunk and accounts for its size.
     ///
     /// Idempotent: inserting an already existing hash does not increase `total_saved_bytes` or `unique_chunks_count`.
     pub fn insert(&mut self, hash: H, data: &[u8]) {
@@ -242,7 +250,7 @@ impl<H: ChunkHash> MetricsDatabase<H> {
         }
     }
 
-    /// Storing the delta (we only account for the size of the compressed delta, saving RAM).
+    /// Accounts for a delta by its size; the delta bytes themselves are not retained.
     ///
     /// Idempotent: inserting an already existing delta hash does not increase `total_saved_bytes` or `delta_chunks_count`.
     pub fn insert_delta(&mut self, hash: H, delta: &[u8]) {
@@ -252,19 +260,22 @@ impl<H: ChunkHash> MetricsDatabase<H> {
         }
     }
 
-    /// Obtaining a reference to a base chunk without unnecessary cloning.
+    /// Returns the bytes of a stored base chunk without cloning.
     pub fn get_ref(&self, hash: &H) -> Option<&[u8]> {
         self.base_chunks.get(hash).map(|v| v.as_slice())
     }
 
+    /// Whether a base chunk with `hash` is stored (deltas are not counted).
     pub fn contains(&self, hash: &H) -> bool {
         self.base_chunks.contains_key(hash)
     }
 
+    /// Number of stored base chunks (deltas are not counted).
     pub fn len(&self) -> usize {
         self.base_chunks.len()
     }
 
+    /// Whether no base chunk is stored.
     pub fn is_empty(&self) -> bool {
         self.base_chunks.is_empty()
     }
